@@ -802,3 +802,18 @@ def main():
 
 if __name__ == "__main__":
     main()
+    ******************************************************************************
+    if comma_mode and ',' in name_core:
+    # split only once into left/right of the first comma
+    parts = [p.strip() for p in name_core.split(',', 1)]
+    last_part = parts[0]
+    rest_part = parts[1]
+
+    # build cleaned token lists (strip punctuation like trailing commas/periods)
+    given_tokens = [t.strip().strip('.,') for t in re.split(r'\s+', rest_part) if t.strip()]
+    last_tokens = [t.strip().strip('.,') for t in re.split(r'\s+', last_part) if t.strip()]
+else:
+    tokens = [t.strip().strip('.,') for t in re.split(r'\s+', name_core) if t.strip()]
+    given_tokens = tokens
+    last_tokens = []
+
