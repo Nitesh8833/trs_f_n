@@ -1,0 +1,137 @@
+I have an Excel file (XLSX) stored in a Google Cloud Storage bucket. One column in the sheet contains person/entity names and short designations in many inconsistent formats. The column header is exactly: header_col_value. I need a robust Python script that:
+
+1) Loads input
+
+Reads a specified XLSX file from a GCS bucket (bucket name and filepath will be provided as parameters).
+
+Works with the first worksheet by default, or accepts a worksheet name parameter.
+
+Expects at least the column header_col_value. If other columns exist they should be preserved in the output.
+
+2) Detects and parses name formats
+
+Parses the value in header_col_value into these output fields:
+
+first_name
+
+middle_name (empty string or null when not present)
+
+last_name
+
+designation (short titles/credentials like MD, PA, PhD, MBA, etc.)
+
+The script must not treat hospital/organization names as first_name or last_name. If the string appears to be a hospital/organization (contains keywords like hospital, clinic, institute, center, university, college, trust, inc, ltd, association, organization, corp — case-insensitive), then set first_name, middle_name, last_name to empty/null, and put a new field organization_name with that value. (Do not copy organization name into name fields.)
+
+Recognize and correctly parse these example formats (the script should be robust to spaces and minor punctuation differences):
+
+LastName, FirstName
+
+LastName, FirstName MiddleName
+
+FirstName MiddleName LastName
+
+FirstName LastName
+
+LastName, FirstName, MD (designation after comma)
+
+LastName, FirstName MD (designation without extra comma)
+
+LastName, FirstName, MD, Hospital/Organization Name
+
+Name/Entity (other) or Name / Entity (other) (treat as organization when parentheses or slashes indicate entity)
+
+LastName FirstName MI (no comma, middle initial)
+
+FirstName LastName, PhD
+
+Company Name (no person present -> treat as organization)
+
+Extract designation if present. Common designations: MD, MBBS, DO, PA, RN, PhD, MBA, BSc, MSc, Dr, Esq, Jr, Sr, I, II, III, etc. The list should be configurable/extendable.
+
+Trim punctuation and whitespace from parsed parts (remove trailing dots in initials, remove extra commas or slashes).
+
+For entries with a comma-separated sequence where the third element is clearly an organization, assign the organization to organization_name and the designation (if present) to designation. If ambiguous, prefer interpreting as designation only when it matches a known designation list.
+
+3) Output
+
+Produce two outputs:
+
+XLSX with the original columns plus the new columns: first_name, middle_name, last_name, designation, organization_name.
+
+JSON file (newline-delimited JSON or a list — specify which as a parameter) with the same fields for each row.
+
+Write both outputs back to a specified GCS path (and optionally save a local copy if a local_output_path parameter is provided).
+
+4) Behavior & edge-cases
+
+If a record cannot be parsed as a person (e.g., long organization name or contains organization keywords), set name fields to null and put the full original value into organization_name.
+
+If a record is partially parseable (e.g., only one token like Madonna), put it into first_name and leave other name fields empty.
+
+Preserve rows order and any other input columns.
+
+Script should log rows that were ambiguous/unparseable into a separate CSV/JSON parsing_issues file with a short reason for manual review.
+
+Handle empty/NaN values gracefully.
+
+5) Implementation requirements
+
+Provide a single, well-documented Python script (or small module) that:
+
+Uses pandas to read/write XLSX and JSON.
+
+Uses google-cloud-storage (or gcsfs) to read/write files in GCS. Show how credentials are expected to be provided (e.g., Application Default Credentials or a service account key file path).
+
+Includes a configuration section for: GCS bucket/path, input filename, output filenames, sheet name, designation list, organization keywords, JSON output format (list or ndjson), and logging level.
+
+Contains a parse_name(value: str, config: dict) -> dict function that returns {first_name, middle_name, last_name, designation, organization_name, parse_confidence} so it can be unit-tested.
+
+Includes a main() that ties everything together and uses the above function row-wise.
+
+Writes a human-readable progress log and an output summary (counts of parsed persons, organizations, ambiguous rows).
+
+Has defensive error handling (bad files, network errors) and returns non-zero exit code on fatal errors.
+
+6) Tests and examples
+
+Include a small unit-test file (e.g., using pytest) that covers at least 12 example inputs and asserts the expected parsed output. Example inputs and expected outputs must be included in the tests. Use the following sample rows (these must be in the tests and documentation):
+
+Input: "Doe, John" -> first_name: "John", last_name: "Doe".
+
+"Doe, John A." -> first_name: "John", middle_name: "A", last_name: "Doe".
+
+"John A Doe" -> first_name: "John", middle_name: "A", last_name: "Doe".
+
+"Doe, John, MD" -> designation: "MD".
+
+"Doe, John MD" -> designation: "MD".
+
+"St Mary Hospital" -> organization_name: "St Mary Hospital"; names null.
+
+"CARE Clinic / Community Health" -> organization_name: "CARE Clinic / Community Health".
+
+"Smith, Anna, MD, City Hospital" -> first_name: "Anna", last_name: "Smith", designation: "MD", organization_name: "City Hospital".
+
+"Prince" -> first_name: "Prince".
+
+"Brown John MI" -> first_name: "John", last_name: "Brown", middle_name: "MI" (for ambiguous no-comma formats, prefer FirstName LastName when a clear pattern is found; if not, document how heuristic determined result).
+
+"Wilson, Mary, PhD" -> designation: "PhD".
+
+"Apollo Pharmacy Pvt Ltd" -> organization_name: "Apollo Pharmacy Pvt Ltd".
+
+7) Deliverables
+
+parse_names.py (main script / module).
+
+requirements.txt with pinned versions (pandas, google-cloud-storage or gcsfs, openpyxl, pytest).
+
+tests/test_parse_name.py with the unit tests above.
+
+README.md describing usage, config variables, expected inputs, and examples of running the script locally and in a container.
+
+8) Extra (optional but preferred)
+
+A small CLI interface (argparse) to run on a local file or a GCS file, choose JSON format (list vs ndjson), and toggle writing parsing_issues.
+
+Provide a short explanation in the README of the heuristics used (comma-presence, known designations list, organization keywords) so reviewers understand decisions.
