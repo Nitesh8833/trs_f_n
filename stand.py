@@ -590,3 +590,283 @@ def main():
 
 if __name__ == "__main__":
     main()
+************************************************************************
+import re
+import pandas as pd
+
+# ----------------------------
+# CONFIG
+# ----------------------------
+INPUT_XLSX = r"C:\path\to\input.xlsx"      # change to your file
+SHEET_NAME = None                          # None => first sheet
+OUTPUT_XLSX = r"C:\path\to\output_with_formats.xlsx"
+SOURCE_COL = "header_col_value"
+# ----------------------------
+
+# Known degree/designation abbreviations (expand as needed)
+DEGREES = [
+    "MD", "MBBS", "DO", "PhD", "MSc", "MS", "MBA", "RN", "R\.?N\.?", "PA", "DVM",
+    "OTR", "CHT", "DDS", "DMD", "BSc", "BPharm", "FRCS", "FRCP", "LPC", "CPA", "Esq"
+]
+# compile as alternation for regex (word boundaries)
+DEGREE_RE = re.compile(r"\b(?:" + "|".join(DEGREES) + r")\b", flags=re.IGNORECASE)
+
+# Organization / facility keywords (expand as needed)
+ORG_KEYWORDS = [
+    "hospital", "clinic", "center", "centre", "institute", "school", "college",
+    "laboratory", "laboratories", "labs", "trust", "clinic", "pharmacy", "care",
+    "health", "healthcare", "medical", "association", "hospitality", "lab", "university"
+]
+ORG_RE = re.compile(r"\b(?:" + "|".join(ORG_KEYWORDS) + r")\b", flags=re.IGNORECASE)
+
+# Helper regexes for common formats
+COMMA_FORMAT_RE = re.compile(r"^\s*([^,]+)\s*,\s*(.+)$")  # "Last, First ..." or "Org, Location"
+PARENS_RE = re.compile(r"(.+?)\s*\((.+)\)\s*$")          # "Name (Affiliation)"
+MULTIPLE_SPACES_RE = re.compile(r"\s+")
+INITIAL_RE = re.compile(r"^[A-Z]\.?$", flags=re.IGNORECASE)  # single initial like "J." or "J"
+
+# common tokens that strongly indicate organization rather than person (word-level)
+ORG_STRONG_TOKENS = {"ltd", "pvt", "inc", "company", "co", "llc", "corp", "clinic", "hospital", "institute", "college", "university", "trust"}
+
+def is_organization(text: str) -> bool:
+    # quick heuristics for organisation:
+    t = text.strip()
+    # contains org keywords
+    if ORG_RE.search(t):
+        return True
+    # contains company suffixes (Ltd, Inc etc.)
+    words = re.findall(r"[A-Za-z0-9]+", t.lower())
+    if any(w in ORG_STRONG_TOKENS for w in words):
+        return True
+    # many uppercase words (like "ABC HOSPITAL") or digits in name
+    if sum(1 for ch in t if ch.isdigit()) >= 2:
+        return True
+    # if entire string ALL CAPS and longer than 2 words, likely org
+    if t.isupper() and len(t.split()) > 1:
+        return True
+    return False
+
+def extract_degrees(text: str):
+    # returns list of degree tokens and string with them removed
+    found = DEGREE_RE.findall(text)
+    cleaned = DEGREE_RE.sub("", text).strip()
+    # normalize found (uppercase, remove dots)
+    found_norm = [re.sub(r"\.", "", f).upper() for f in found]
+    return list(dict.fromkeys(found_norm)), MULTIPLE_SPACES_RE.sub(" ", cleaned)
+
+def detect_format(raw: str):
+    """Return a dict with detected_format and parsed components (best-effort)."""
+    if raw is None:
+        return {"detected_format": "empty", "first_name": None, "middle_name": None, "last_name": None, "designation": None, "organization": None}
+
+    s = str(raw).strip()
+    if s == "":
+        return {"detected_format": "empty", "first_name": None, "middle_name": None, "last_name": None, "designation": None, "organization": None}
+
+    # remove redundant whitespace
+    s = MULTIPLE_SPACES_RE.sub(" ", s)
+
+    # Extract degrees / designations
+    degrees, s_no_deg = extract_degrees(s)
+
+    # If the whole string looks like an organization, label it
+    if is_organization(s_no_deg):
+        return {
+            "detected_format": "organization",
+            "first_name": None,
+            "middle_name": None,
+            "last_name": None,
+            "designation": ", ".join(degrees) if degrees else None,
+            "organization": s_no_deg
+        }
+
+    # 1) Comma formats: "Last, First [Middle] [Degree]" or "Org, Location"
+    m = COMMA_FORMAT_RE.match(s_no_deg)
+    if m:
+        left = m.group(1).strip()
+        right = m.group(2).strip()
+        # If left looks like last name (single token, maybe with Jr/Sr)
+        left_tokens = left.split()
+        right_tokens = right.split()
+        # Heuristic: if right begins with a capitalized name token, assume "Last, First ..."
+        # Also check that left is not organization-like
+        if not is_organization(left):
+            # right could be "First Middle"
+            first = right_tokens[0] if right_tokens else None
+            middle = " ".join(right_tokens[1:]) if len(right_tokens) > 1 else None
+            return {
+                "detected_format": "last_name,first_name" + (",degree" if degrees else ""),
+                "first_name": first,
+                "middle_name": middle,
+                "last_name": left,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": None
+            }
+        else:
+            # left is an org
+            return {
+                "detected_format": "organization",
+                "first_name": None,
+                "middle_name": None,
+                "last_name": None,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": s_no_deg
+            }
+
+    # 2) Parentheses maybe indicate affiliation: "Name (Hospital ABC)" or "Org (City)"
+    m2 = PARENS_RE.match(s_no_deg)
+    if m2:
+        before = m2.group(1).strip()
+        inside = m2.group(2).strip()
+        # if inside contains org keywords, label as person with org
+        if ORG_RE.search(inside) or is_organization(inside):
+            # parse person name in 'before' if possible
+            parts = before.split()
+            if len(parts) == 1:
+                first = parts[0]
+                last = None
+            elif len(parts) == 2:
+                first, last = parts
+            else:
+                first = parts[0]
+                last = parts[-1]
+                middle = " ".join(parts[1:-1]) if len(parts) > 2 else None
+                return {
+                    "detected_format": "first_name last_name (organization)",
+                    "first_name": first,
+                    "middle_name": middle,
+                    "last_name": last,
+                    "designation": ", ".join(degrees) if degrees else None,
+                    "organization": inside
+                }
+            return {
+                "detected_format": "first_name last_name (organization)",
+                "first_name": first,
+                "middle_name": None,
+                "last_name": last,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": inside
+            }
+        else:
+            # parentheses but not an org -> treat as "Name (extra)"
+            return {
+                "detected_format": "unknown_with_parenthesis",
+                "first_name": None,
+                "middle_name": None,
+                "last_name": None,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": s_no_deg
+            }
+
+    # 3) Plain tokens separated by spaces -> assume "First Middle Last" or single token (organization or single name)
+    tokens = s_no_deg.split()
+    # Catch single token -> either single name or org
+    if len(tokens) == 1:
+        # if token contains words like hospital etc, organization else single name
+        if is_organization(tokens[0]):
+            return {
+                "detected_format": "organization",
+                "first_name": None, "middle_name": None, "last_name": None,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": tokens[0]
+            }
+        else:
+            return {
+                "detected_format": "single_name",
+                "first_name": tokens[0], "middle_name": None, "last_name": None,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": None
+            }
+
+    # 4) Two tokens -> most likely "First Last"
+    if len(tokens) == 2:
+        return {
+            "detected_format": "first_name last_name" + (",degree" if degrees else ""),
+            "first_name": tokens[0],
+            "middle_name": None,
+            "last_name": tokens[1],
+            "designation": ", ".join(degrees) if degrees else None,
+            "organization": None
+        }
+
+    # 5) More than two tokens -> assume first, middle(s), last
+    if len(tokens) >= 3:
+        first = tokens[0]
+        last = tokens[-1]
+        middle = " ".join(tokens[1:-1])
+        # edge: if tokens contain Jr/Sr etc at end, handle that (optional)
+        suffixes = {"jr", "sr", "ii", "iii", "iv"}
+        if last.lower().strip(".") in suffixes and len(tokens) >= 4:
+            # shift suffix out
+            suffix = last
+            last = tokens[-2]
+            middle = " ".join(tokens[1:-2]) if len(tokens) > 3 else None
+            return {
+                "detected_format": "first middle last, suffix" + (",degree" if degrees else ""),
+                "first_name": first,
+                "middle_name": middle,
+                "last_name": last + " " + suffix,
+                "designation": ", ".join(degrees) if degrees else None,
+                "organization": None
+            }
+        return {
+            "detected_format": "first_name middle_name last_name" + (",degree" if degrees else ""),
+            "first_name": first,
+            "middle_name": middle,
+            "last_name": last,
+            "designation": ", ".join(degrees) if degrees else None,
+            "organization": None
+        }
+
+    # default fallback
+    return {
+        "detected_format": "other",
+        "first_name": None,
+        "middle_name": None,
+        "last_name": None,
+        "designation": ", ".join(degrees) if degrees else None,
+        "organization": None
+    }
+
+def process_dataframe(df: pd.DataFrame, source_col: str = SOURCE_COL) -> pd.DataFrame:
+    if source_col not in df.columns:
+        raise ValueError(f"Column '{source_col}' not found in DataFrame")
+
+    # Prepare lists for new columns
+    detected = []
+    firsts = []
+    middles = []
+    lasts = []
+    designations = []
+    orgs = []
+
+    for val in df[source_col].tolist():
+        res = detect_format(val)
+        detected.append(res["detected_format"])
+        firsts.append(res.get("first_name"))
+        middles.append(res.get("middle_name"))
+        lasts.append(res.get("last_name"))
+        designations.append(res.get("designation"))
+        orgs.append(res.get("organization"))
+
+    # add columns
+    df_out = df.copy()
+    df_out["detected_format"] = detected
+    df_out["first_name_parsed"] = firsts
+    df_out["middle_name_parsed"] = middles
+    df_out["last_name_parsed"] = lasts
+    df_out["designation_parsed"] = designations
+    df_out["organization_parsed"] = orgs
+    return df_out
+
+def main():
+    print("Loading", INPUT_XLSX)
+    df = pd.read_excel(INPUT_XLSX, sheet_name=SHEET_NAME, dtype=str)
+    print(f"Rows read: {len(df)}")
+    df_processed = process_dataframe(df, source_col=SOURCE_COL)
+    print("Saving to", OUTPUT_XLSX)
+    df_processed.to_excel(OUTPUT_XLSX, index=False)
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
