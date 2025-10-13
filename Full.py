@@ -1,275 +1,259 @@
+#!/usr/bin/env python3
+import json
 import re
 import pandas as pd
-import difflib
 
-# ========================
-# CONFIG (EDIT THESE)
-# ========================
-INPUT_XLSX = r"C:\path\to\your_input.xlsx"
-SHEET_NAME = None  # None => first sheet
-OUTPUT_XLSX = r"C:\path\to\parsed_output.xlsx"
+INPUT_XLSX = r"H:\Transformation\2025\oct\Week2\file_Name_new\Provider_name_analysis.xlsx"
+OUTPUT_XLSX = r"H:\Transformation\2025\oct\Week2\file_Name_new\fullName_Parsed.xlsx"
+OUTPUT_JSONL = r"H:\Transformation\2025\oct\Week2\file_Name_new\fullName_parsed_v6_1.jsonl"
 
-# ========================
-# Lists
-# ========================
-org_keywords = [
-    "health","medcare","medicine","clinic","hospital",
-    "medical","university","wakemed","center","centre","practice"
-]
-
-degree_list = [
-    "MD","M.D.","DO","D.O.","PA","PA-C","APRN","DNP","PhD","Ph.D.","M.P.H.","MPH",
-    "MS","M.S.","M.S.Ed","MS.Ed","Ed.D","EdD","CRNA","DPT","RN","OTR","BCBA",
-    "RD","LD","FACOG","MBA","MSEd","III","II","IV"
-]
-
-degree_list_sorted = sorted(set(degree_list), key=lambda x: -len(x))
-degree_pattern = r'\b(?:' + '|'.join(re.escape(d) for d in degree_list_sorted) + r')\b\.?'
-
-canonical = {
-    "M.D.": "MD", "MD": "MD",
-    "D.O.": "DO", "DO": "DO",
-    "Ph.D.": "PhD", "PhD": "PhD",
-    "M.P.H.": "MPH", "MPH": "MPH",
-    "M.S.": "MS", "MS": "MS",
-    "M.S.Ed": "MSEd", "MS.Ed": "MSEd",
-    "Ed.D": "EdD", "EdD": "EdD",
-    "DNP": "DNP", "CRNA": "CRNA",
-    "PA-C": "PA-C", "PA": "PA",
-    "DPT": "DPT", "RN": "RN",
-    "BCBA": "BCBA", "RD": "RD", "LD": "LD",
-    "MBA": "MBA"
+# Candidate name column headers (case-insensitive)
+NAME_COL_CANDIDATES = {
+    'header_col_value', 'full name', 'full_name',
+    'orig full name', 'provider_full_name'
 }
 
-suffix_tokens = {"Jr", "Jr.", "Sr", "Sr.", "II", "III", "IV"}
+# Organization keywords (case-insensitive). Edit or extend this list as needed.
+ORG_KEYWORDS = [
+    "health", "MedCare", "Medicine", "Clinic", "Hospital", "Medical",
+    "University", "WakeMed"
+]
 
-# target logical column name we want to find
-TARGET_COLUMN = "header_col_value"
+# Normalize ORG keywords for regex (create an alternation, case-insensitive)
+ORG_RE = re.compile(r"\b(" + r"|".join(re.escape(k) for k in ORG_KEYWORDS) + r")\b", flags=re.IGNORECASE)
 
-# ========================
-# Utility: normalize column names
-# ========================
-def normalize_colname(c):
-    if c is None:
-        return ""
-    # strip, lower, replace whitespace and non-alphanumeric with underscore
-    c = str(c).strip().lower()
-    c = re.sub(r'[\s\-\./\\]+', '_', c)          # spaces, dashes, dots -> underscore
-    c = re.sub(r'[^0-9a-z_]', '', c)             # remove other punctuation
-    c = re.sub(r'_+', '_', c)                    # collapse multiple underscores
-    c = c.strip('_')
-    return c
+RAW_DEGREE_ALIASES = {
+    'm.d.': 'MD', 'md': 'MD', 'MD': 'MD',
+    'ph.d.': 'PhD', 'phd': 'PhD', 'PhD': 'PhD',
+    'd.o.': 'DO', 'do': 'DO', 'DO': 'DO',
+    'r.n.': 'RN', 'rn': 'RN', 'RN': 'RN',
+    'd.d.s.': 'DDS', 'dds': 'DDS', 'DDS': 'DDS',
+    'd.c.': 'DC', 'dc': 'DC', 'DC': 'DC',
+    'm.b.b.s.': 'MBBS', 'mbbs': 'MBBS', 'MBBS': 'MBBS',
+    'd.m.': 'DM', 'dm': 'DM', 'DM': 'DM',
 
-# ========================
-# Column autodetect
-# ========================
-def autodetect_header_column(df_columns, target=TARGET_COLUMN):
-    # produce mapping normalized -> original
-    norm_map = {normalize_colname(c): c for c in df_columns}
-    norm_list = list(norm_map.keys())
+    'pa': 'PA', 'pa-c': 'PA-C', 'pa c': 'PA-C', 'pa-c.': 'PA-C',
+    'aprn': 'APRN', 'crna': 'CRNA', 'np': 'NP', 'np-c': 'NP-C', 'NP-C': 'NP-C',
 
-    target_norm = normalize_colname(target)
+    'dpt': 'DPT', 'd.p.t.': 'DPT',
+    'dpm': 'DPM', 'd.p.m.': 'DPM',
+    'pt': 'PT', 'otr': 'OTR', 'otr/l': 'OTR/L',
 
-    # 1) exact normalized match
-    if target_norm in norm_map:
-        chosen = norm_map[target_norm]
-        print(f"Autodetect: exact normalized match -> '{chosen}'")
-        return chosen
+    'aud': 'AUD', 'msw': 'MSW', 'rnfa': 'RNFA',
+    'dnp': 'DNP', 'fnp': 'FNP', 'cnm': 'CNM', 'cns': 'CNS',
 
-    # 2) substring/keyword heuristics: look for cols containing both 'header' and 'value' or 'header' & 'col'
-    for norm_c, orig in norm_map.items():
-        if ('header' in norm_c and 'value' in norm_c) or ('header' in norm_c and 'col' in norm_c):
-            print(f"Autodetect: heuristic substring match -> '{orig}' (normalized='{norm_c}')")
-            return orig
+    'rt': 'RT', 'rtt': 'RTT', 'rd': 'RD', 'rdn': 'RDN',
+    'rdms': 'RDMS', 'rdcs': 'RDCS',
 
-    # 3) substring: contains 'header' or contains 'value' (prefer 'header')
-    header_candidates = [orig for norm_c, orig in norm_map.items() if 'header' in norm_c]
-    value_candidates = [orig for norm_c, orig in norm_map.items() if 'value' in norm_c]
-    col_candidates = [orig for norm_c, orig in norm_map.items() if 'col' in norm_c]
+    'msc': 'MSC', 'ms': 'MS', 'ma': 'MA', 'mba': 'MBA', 'mph': 'MPH',
 
-    if header_candidates:
-        print(f"Autodetect: choosing first header-like column -> '{header_candidates[0]}'")
-        return header_candidates[0]
-    if value_candidates:
-        print(f"Autodetect: choosing first value-like column -> '{value_candidates[0]}'")
-        return value_candidates[0]
-    if col_candidates:
-        print(f"Autodetect: choosing first col-like column -> '{col_candidates[0]}'")
-        return col_candidates[0]
+    # Explicit include for uppercase specialty token:
+    'obgyn': 'OBGYN'
+}
 
-    # 4) fuzzy match with difflib
-    # try to match against the raw original names too (use both)
-    raw_cols = list(df_columns)
-    attempt_space = target.replace('_', ' ')
-    candidates = difflib.get_close_matches(attempt_space, raw_cols, n=3, cutoff=0.6)
-    if candidates:
-        print(f"Autodetect: fuzzy match against original names -> candidates: {candidates}")
-        print(f"Autodetect: choosing '{candidates[0]}'")
-        return candidates[0]
+SUFFIXES = {'jr', 'sr', 'ii', 'iii', 'iv', 'v', 'vi'}
+ROMAN_NUMERALS = {'I', 'II', 'III', 'IV', 'V', 'VI'}
+TITLES = {'dr', 'mr', 'mrs', 'ms', 'prof', 'sir', 'madam', 'miss'}
 
-    # try normalized fuzzy
-    candidates_norm = difflib.get_close_matches(target_norm, norm_list, n=3, cutoff=0.6)
-    if candidates_norm:
-        chosen = norm_map[candidates_norm[0]]
-        print(f"Autodetect: fuzzy match on normalized names -> '{chosen}'")
-        return chosen
+SPLIT_NO_HYPHEN = re.compile(r"[\s,]+")
+UPPERCASE_DEG_RE = re.compile(r"[A-Z][A-Z\-]+$")
+DASH_ONLY = {'-', '–', '—'}
 
-    # final fallback: nothing found
-    raise KeyError(
-        f"Could not autodetect a column similar to '{target}'. Available columns: {list(df_columns)}"
-    )
+def normalize_token(tok: str) -> str:
+    return re.sub(r"[\s\-.]", '', str(tok)).lower()
 
-# ========================
-# Parsing function (same as before)
-# ========================
-def parse_header_value(s_raw):
-    out = {"First_Name": "", "Middle_Name": "", "Last_Name": "", "Degree": "", "Organization": ""}
+DEGREE_MAP = {normalize_token(k): v for k, v in RAW_DEGREE_ALIASES.items()}
+DEGREE_KEYS = set(DEGREE_MAP.keys())
 
-    if pd.isna(s_raw):
-        return out
+def strip_leading_titles(text: str) -> str:
+    t = text.strip()
+    while True:
+        m = re.match(r"^(?P<title>[A-Za-z]+)\.?\s+(.*)$", t)
+        if m and m.group('title').lower() in TITLES:
+            t = m.group(2)
+            continue
+        break
+    return t.strip()
 
-    s = str(s_raw).strip()
-    s = re.sub(r'\s+', ' ', s)
-    s = re.sub(r',\s*', ',', s)
-    s = s.strip(' ,')
+def smart_title(s: str) -> str:
+    def fix_token(tok: str) -> str:
+        if tok.upper() in {'II', 'III', 'IV', 'VI'}:
+            return tok.upper()
+        if re.match(r"^[A-Za-z]\.$", tok):  # initials like J.
+            return tok.upper()
+        if re.match(r"^O[Oo]+", tok):
+            return "O" + tok[2:].capitalize()
+        if '-' in tok:
+            return '-'.join(fix_token(part) for part in tok.split('-'))
+        return tok.capitalize()
+    return ' '.join(fix_token(t) for t in s.split())
 
-    # Organization detection (use normalized lowercase substring match)
-    s_lower = s.lower()
-    for kw in org_keywords:
-        if kw.lower() in s_lower:
-            out["Organization"] = s
-            return out
-
-    # Extract degrees (may be multiple)
-    raw_degrees = [m.group(0).strip().strip('.') for m in re.finditer(degree_pattern, s, flags=re.IGNORECASE)]
-    degrees_found, seen = [], set()
-    for d in raw_degrees:
-        key = canonical.get(d.upper().replace('.', ''), d.upper().replace('.', ''))
-        if key not in seen:
-            seen.add(key)
-            pretty = canonical.get(d, canonical.get(d.upper().replace('.', ''), d.replace('.', '')))
-            degrees_found.append(pretty)
-
-    if degrees_found:
-        # remove degree tokens and trailing punctuation/commas
-        s = re.sub(degree_pattern + r'(?:(?:\s*[/,&]\s*)|\s+|[.,])?', '', s, flags=re.IGNORECASE)
-        s = s.strip(' ,')
-
-    # Parse name content
-    if ',' in s:
-        parts = [p.strip() for p in s.split(',') if p.strip()]
-        filtered_parts = [p for p in parts if not re.search(degree_pattern, p, flags=re.IGNORECASE)]
-        parts = filtered_parts
-
-        if len(parts) == 1:
-            tokens = parts[0].split()
-            if len(tokens) == 1:
-                out["Last_Name"] = tokens[0]
-            elif len(tokens) == 2:
-                out["First_Name"], out["Last_Name"] = tokens
-            else:
-                out["First_Name"] = tokens[0]
-                out["Middle_Name"] = " ".join(tokens[1:-1])
-                out["Last_Name"] = tokens[-1]
+def extract_degrees_from_part(part: str) -> list:
+    """
+    Return a list of normalized degrees found in a comma/space separated part.
+    Recognizes canonical degrees and fully UPPERCASE tokens (except Roman numerals).
+    """
+    if not isinstance(part, str) or not part.strip():
+        return []
+    tokens = SPLIT_NO_HYPHEN.split(part.strip())
+    out = []
+    for t in tokens:
+        if not t or t in DASH_ONLY:
+            continue
+        key = normalize_token(t)
+        if key in DEGREE_MAP:
+            out.append(DEGREE_MAP[key])
         else:
-            out["Last_Name"] = parts[0]
-            remainder = " ".join(parts[1:])
-            rem_tokens = remainder.split()
-            if len(rem_tokens) == 1:
-                out["First_Name"] = rem_tokens[0]
-            elif len(rem_tokens) >= 2:
-                out["First_Name"] = rem_tokens[0]
-                out["Middle_Name"] = " ".join(rem_tokens[1:])
-    else:
-        tokens = s.split()
-        if len(tokens) == 1:
-            out["Last_Name"] = tokens[0]
-        elif len(tokens) == 2:
-            out["First_Name"], out["Last_Name"] = tokens
-        else:
-            out["First_Name"] = tokens[0]
-            if tokens[-1].replace('.', '') in suffix_tokens:
-                out["Last_Name"] = " ".join(tokens[-2:])
-                out["Middle_Name"] = " ".join(tokens[1:-2])
-            else:
-                out["Last_Name"] = tokens[-1]
-                out["Middle_Name"] = " ".join(tokens[1:-1])
-
-    for k in ("First_Name", "Middle_Name", "Last_Name"):
-        out[k] = out[k].strip(" .,")
-
-    if degrees_found:
-        out["Degree"] = ", ".join(degrees_found)
-
-    if not (out["First_Name"] or out["Last_Name"] or out["Middle_Name"]) and not out["Organization"]:
-        out["Organization"] = s_raw
-
+            # Treat fully UPPERCASE tokens as degrees (exclude Roman numerals)
+            if UPPERCASE_DEG_RE.match(t) and t.upper() not in ROMAN_NUMERALS and len(t) >= 2:
+                out.append(t.upper())
     return out
 
-# ========================
-# Process Excel
-# ========================
-def process_excel(input_xlsx, output_xlsx, sheet_name=None):
-    # Read sheet(s)
-    # Using sheet_name=None returns dict of DataFrames; handle both cases
-    data = pd.read_excel(input_xlsx, sheet_name=sheet_name, dtype=str)
-
-    # If pandas returned a dict (multiple sheets), pick the requested sheet or the first one
-    if isinstance(data, dict):
-        if sheet_name is None:
-            # take the first sheet
-            first_sheet = list(data.keys())[0]
-            df = data[first_sheet]
-            print(f"Loaded first sheet: '{first_sheet}'")
+def parse_with_degree(raw: str):
+    """Returns (firstname, lastname, middlename, medical_degree)."""
+    if pd.isna(raw):
+        return '', '', '', 'NA'
+    s = str(raw).strip().replace(';', "")
+    if not s:
+        return '', '', '', 'NA'
+    parts = [p.strip() for p in re.split(r"\s*,\s*", s) if p.strip()]
+    # 1) Collect degrees from trailing comma-separated parts
+    degrees = []
+    for p in parts[1:]:
+        degrees.extend(extract_degrees_from_part(p))
+    # 2) Remove pure-degree trailing parts so they don't affect name parsing
+    while parts:
+        cand = parts[-1]
+        toks = [t for t in SPLIT_NO_HYPHEN.split(cand) if t and t not in DASH_ONLY]
+        if toks and all(
+            (normalize_token(t) in DEGREE_KEYS)
+            or (UPPERCASE_DEG_RE.match(t) and t.upper() not in ROMAN_NUMERALS and len(t) >= 2)
+            for t in toks
+        ):
+            parts.pop()
         else:
-            if sheet_name in data:
-                df = data[sheet_name]
-                print(f"Loaded sheet: '{sheet_name}'")
+            break
+    # 3) Suffix handling (Jr, Sr, II, III, IV...)
+    suffix = ''
+    if len(parts) >= 3 and normalize_token(parts[-1]) in SUFFIXES:
+        suffix = parts.pop()
+    # 4) Parse based on comma format or space format
+    if len(parts) >= 2 and ',' in s:
+        last_base = parts[0]
+        right = strip_leading_titles(parts[1])
+        right_tokens = right.split()
+        kept_tokens = []
+        for t in right_tokens:
+            if t in DASH_ONLY:
+                continue
+            key = normalize_token(t)
+            if key in DEGREE_MAP:
+                degrees.append(DEGREE_MAP[key])
+            elif UPPERCASE_DEG_RE.match(t) and t.upper() not in ROMAN_NUMERALS and len(t) >= 2:
+                degrees.append(t.upper())
             else:
-                raise KeyError(f"Sheet '{sheet_name}' not found. Available sheets: {list(data.keys())}")
-    elif isinstance(data, pd.DataFrame):
-        df = data
+                kept_tokens.append(t)
+        if len(kept_tokens) == 0:
+            first, middle = '', ''
+        elif len(kept_tokens) == 1:
+            first, middle = kept_tokens[0], ''
+        else:
+            first, middle = kept_tokens[0], ' '.join(kept_tokens[1:])
+        last = last_base if not suffix else f"{last_base} {suffix.upper()}"
     else:
-        raise TypeError("Could not read the Excel file into a DataFrame.")
+        # "Firstname Middlename Lastname [Degrees]" (no comma)
+        name2 = strip_leading_titles(' '.join(parts))
+        tokens = name2.split()
+        kept = []
+        for t in tokens:
+            if t in DASH_ONLY:
+                continue
+            key = normalize_token(t)
+            if key in DEGREE_MAP:
+                degrees.append(DEGREE_MAP[key])
+            elif UPPERCASE_DEG_RE.match(t) and t.upper() not in ROMAN_NUMERALS and len(t) >= 2:
+                degrees.append(t.upper())
+            else:
+                kept.append(t)
+        if len(kept) == 0:
+            medical_degree = ', '.join(dict.fromkeys(degrees)) if degrees else 'NA'
+            return '', '', '', medical_degree
+        if len(kept) == 1:
+            first, last, middle = kept[0], '', ''
+        elif len(kept) == 2:
+            first, last, middle = kept[0], kept[1], ''
+        else:
+            first, last = kept[0], kept[-1]
+            middle = ' '.join(kept[1:-1])
+    # 5) Normalize degree list: de-duplicate preserving order, join with comma+space
+    if degrees:
+        seen = set()
+        deg_norm = []
+        for d in degrees:
+            if d not in seen:
+                seen.add(d)
+                deg_norm.append(d)
+        medical_degree = ', '.join(deg_norm)
+    else:
+        medical_degree = 'NA'
+    # 6) Titlecase name parts
+    return smart_title(first), smart_title(last), smart_title(middle), medical_degree
 
-    # Save original columns for debugging
-    original_columns = list(df.columns)
-    print("Original columns found:", original_columns)
+def is_organization_entry(s: str) -> bool:
+    """Return True if string s appears to be an organization based on ORG_RE."""
+    if not isinstance(s, str) or not s.strip():
+        return False
+    return ORG_RE.search(s) is not None
 
-    # Standardize column names
-    norm_to_orig = {normalize_colname(c): c for c in original_columns}
-    df.columns = [normalize_colname(c) for c in original_columns]
-
-    # Try to find the correct column automatically
+def main():
+    # Load input xlsx
     try:
-        chosen_orig = autodetect_header_column(original_columns, target=TARGET_COLUMN)
-        # map chosen_orig to the normalized name used in df (since df.columns are normalized)
-        chosen_norm = normalize_colname(chosen_orig)
-        print(f"Using column: '{chosen_orig}' (normalized as '{chosen_norm}') for parsing")
-    except KeyError as e:
-        # Provide helpful debug info
-        print(str(e))
-        print("Normalized available columns:", list(df.columns))
-        raise
+        df = pd.read_excel(INPUT_XLSX, engine='openpyxl')
+    except Exception:
+        df = pd.read_excel(INPUT_XLSX, engine='xlrd')
 
-    # now parse values from the chosen normalized column
-    parsed_rows = [parse_header_value(val) for val in df[chosen_norm]]
-    parsed_df = pd.DataFrame(parsed_rows, index=df.index)
+    # Determine which column contains the name strings
+    lower_map = {c: str(c).strip().lower() for c in df.columns}
+    name_col = None
+    for c in df.columns:
+        if lower_map[c] in NAME_COL_CANDIDATES:
+            name_col = c
+            break
+    if name_col is None:
+        name_col = df.columns[0]
 
-    # to preserve original dataframe's columns (unnormalized), restore them in result
-    df_result = df.copy()
-    # rename df_result columns back to original names for neatness
-    df_result.columns = original_columns
+    # Parse all rows with existing logic
+    parsed = df[name_col].apply(parse_with_degree)
+    res = pd.DataFrame(parsed.tolist(), columns=['firstname', 'lastname', 'middlename', 'medical_degree'])
+    res.insert(0, 'input_fullname', df[name_col].fillna('').astype(str))
 
-    # append parsed columns
-    result = pd.concat([df_result, parsed_df], axis=1)
+    # NEW: organization detection (dynamic)
+    # If input_fullname contains any organization keyword, set 'organization' to the raw string
+    # and blank out the name fields and medical_degree for that row.
+    res['organization'] = ''
+    for idx, raw in res['input_fullname'].items():
+        if is_organization_entry(raw):
+            res.at[idx, 'organization'] = raw
+            # keep columns blank when organization detected
+            res.at[idx, 'firstname'] = ''
+            res.at[idx, 'lastname'] = ''
+            res.at[idx, 'middlename'] = ''
+            res.at[idx, 'medical_degree'] = ''
 
-    result.to_excel(output_xlsx, index=False)
-    print(f"✅ Parsed results saved to: {output_xlsx}")
-    return result
+    # Save Excel
+    res.to_excel(OUTPUT_XLSX, index=False)
 
-# ========================
-# RUN
-# ========================
-if __name__ == "__main__":
-    process_excel(INPUT_XLSX, OUTPUT_XLSX, sheet_name=SHEET_NAME)
+    # Save JSONL including organization
+    with open(OUTPUT_JSONL, 'w', encoding='utf-8') as f:
+        for _, r in res.iterrows():
+            obj = {
+                'firstname': r['firstname'] if r['firstname'] else '',
+                'lastname': r['lastname'] if r['lastname'] else '',
+                'middlename': r['middlename'] if r['middlename'] else '',
+                'medical_degree': r['medical_degree'] if r['medical_degree'] else '',
+                'organization': r['organization'] if r['organization'] else ''
+            }
+            f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+
+if __name__ == '__main__':
+    main()
