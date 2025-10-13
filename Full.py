@@ -1,19 +1,20 @@
 import re
 import pandas as pd
+import difflib
 
 # ========================
 # CONFIG (EDIT THESE)
 # ========================
 INPUT_XLSX = r"C:\path\to\your_input.xlsx"
-SHEET_NAME = None  # use None for the first sheet
+SHEET_NAME = None  # None => first sheet
 OUTPUT_XLSX = r"C:\path\to\parsed_output.xlsx"
 
 # ========================
 # Lists
 # ========================
 org_keywords = [
-    "health","MedCare","Medicine","Clinic","Hospital",
-    "Medical","University","WakeMed","Center","Centre","Practice"
+    "health","medcare","medicine","clinic","hospital",
+    "medical","university","wakemed","center","centre","practice"
 ]
 
 degree_list = [
@@ -42,8 +43,84 @@ canonical = {
 
 suffix_tokens = {"Jr", "Jr.", "Sr", "Sr.", "II", "III", "IV"}
 
+# target logical column name we want to find
+TARGET_COLUMN = "header_col_value"
+
 # ========================
-# Parsing function
+# Utility: normalize column names
+# ========================
+def normalize_colname(c):
+    if c is None:
+        return ""
+    # strip, lower, replace whitespace and non-alphanumeric with underscore
+    c = str(c).strip().lower()
+    c = re.sub(r'[\s\-\./\\]+', '_', c)          # spaces, dashes, dots -> underscore
+    c = re.sub(r'[^0-9a-z_]', '', c)             # remove other punctuation
+    c = re.sub(r'_+', '_', c)                    # collapse multiple underscores
+    c = c.strip('_')
+    return c
+
+# ========================
+# Column autodetect
+# ========================
+def autodetect_header_column(df_columns, target=TARGET_COLUMN):
+    # produce mapping normalized -> original
+    norm_map = {normalize_colname(c): c for c in df_columns}
+    norm_list = list(norm_map.keys())
+
+    target_norm = normalize_colname(target)
+
+    # 1) exact normalized match
+    if target_norm in norm_map:
+        chosen = norm_map[target_norm]
+        print(f"Autodetect: exact normalized match -> '{chosen}'")
+        return chosen
+
+    # 2) substring/keyword heuristics: look for cols containing both 'header' and 'value' or 'header' & 'col'
+    for norm_c, orig in norm_map.items():
+        if ('header' in norm_c and 'value' in norm_c) or ('header' in norm_c and 'col' in norm_c):
+            print(f"Autodetect: heuristic substring match -> '{orig}' (normalized='{norm_c}')")
+            return orig
+
+    # 3) substring: contains 'header' or contains 'value' (prefer 'header')
+    header_candidates = [orig for norm_c, orig in norm_map.items() if 'header' in norm_c]
+    value_candidates = [orig for norm_c, orig in norm_map.items() if 'value' in norm_c]
+    col_candidates = [orig for norm_c, orig in norm_map.items() if 'col' in norm_c]
+
+    if header_candidates:
+        print(f"Autodetect: choosing first header-like column -> '{header_candidates[0]}'")
+        return header_candidates[0]
+    if value_candidates:
+        print(f"Autodetect: choosing first value-like column -> '{value_candidates[0]}'")
+        return value_candidates[0]
+    if col_candidates:
+        print(f"Autodetect: choosing first col-like column -> '{col_candidates[0]}'")
+        return col_candidates[0]
+
+    # 4) fuzzy match with difflib
+    # try to match against the raw original names too (use both)
+    raw_cols = list(df_columns)
+    attempt_space = target.replace('_', ' ')
+    candidates = difflib.get_close_matches(attempt_space, raw_cols, n=3, cutoff=0.6)
+    if candidates:
+        print(f"Autodetect: fuzzy match against original names -> candidates: {candidates}")
+        print(f"Autodetect: choosing '{candidates[0]}'")
+        return candidates[0]
+
+    # try normalized fuzzy
+    candidates_norm = difflib.get_close_matches(target_norm, norm_list, n=3, cutoff=0.6)
+    if candidates_norm:
+        chosen = norm_map[candidates_norm[0]]
+        print(f"Autodetect: fuzzy match on normalized names -> '{chosen}'")
+        return chosen
+
+    # final fallback: nothing found
+    raise KeyError(
+        f"Could not autodetect a column similar to '{target}'. Available columns: {list(df_columns)}"
+    )
+
+# ========================
+# Parsing function (same as before)
 # ========================
 def parse_header_value(s_raw):
     out = {"First_Name": "", "Middle_Name": "", "Last_Name": "", "Degree": "", "Organization": ""}
@@ -56,14 +133,14 @@ def parse_header_value(s_raw):
     s = re.sub(r',\s*', ',', s)
     s = s.strip(' ,')
 
-    # Organization detection
+    # Organization detection (use normalized lowercase substring match)
     s_lower = s.lower()
     for kw in org_keywords:
         if kw.lower() in s_lower:
             out["Organization"] = s
             return out
 
-    # Extract degrees
+    # Extract degrees (may be multiple)
     raw_degrees = [m.group(0).strip().strip('.') for m in re.finditer(degree_pattern, s, flags=re.IGNORECASE)]
     degrees_found, seen = [], set()
     for d in raw_degrees:
@@ -74,10 +151,11 @@ def parse_header_value(s_raw):
             degrees_found.append(pretty)
 
     if degrees_found:
+        # remove degree tokens and trailing punctuation/commas
         s = re.sub(degree_pattern + r'(?:(?:\s*[/,&]\s*)|\s+|[.,])?', '', s, flags=re.IGNORECASE)
         s = s.strip(' ,')
 
-    # Parse name
+    # Parse name content
     if ',' in s:
         parts = [p.strip() for p in s.split(',') if p.strip()]
         filtered_parts = [p for p in parts if not re.search(degree_pattern, p, flags=re.IGNORECASE)]
@@ -132,19 +210,60 @@ def parse_header_value(s_raw):
 # Process Excel
 # ========================
 def process_excel(input_xlsx, output_xlsx, sheet_name=None):
-    df = pd.read_excel(input_xlsx, sheet_name=sheet_name, dtype=str)
+    # Read sheet(s)
+    # Using sheet_name=None returns dict of DataFrames; handle both cases
+    data = pd.read_excel(input_xlsx, sheet_name=sheet_name, dtype=str)
 
-    # ✅ FIX for "dict object has no attribute 'columns'"
-    if not isinstance(df, pd.DataFrame):
-        raise TypeError("The input file could not be read as a DataFrame. Check file and sheet name.")
+    # If pandas returned a dict (multiple sheets), pick the requested sheet or the first one
+    if isinstance(data, dict):
+        if sheet_name is None:
+            # take the first sheet
+            first_sheet = list(data.keys())[0]
+            df = data[first_sheet]
+            print(f"Loaded first sheet: '{first_sheet}'")
+        else:
+            if sheet_name in data:
+                df = data[sheet_name]
+                print(f"Loaded sheet: '{sheet_name}'")
+            else:
+                raise KeyError(f"Sheet '{sheet_name}' not found. Available sheets: {list(data.keys())}")
+    elif isinstance(data, pd.DataFrame):
+        df = data
+    else:
+        raise TypeError("Could not read the Excel file into a DataFrame.")
 
-    if 'header_col_value' not in df.columns:
-        raise KeyError("Input Excel does not contain column 'header_col_value'")
+    # Save original columns for debugging
+    original_columns = list(df.columns)
+    print("Original columns found:", original_columns)
 
-    parsed_rows = [parse_header_value(val) for val in df['header_col_value']]
-    parsed_df = pd.DataFrame(parsed_rows)
+    # Standardize column names
+    norm_to_orig = {normalize_colname(c): c for c in original_columns}
+    df.columns = [normalize_colname(c) for c in original_columns]
 
-    result = pd.concat([df, parsed_df], axis=1)
+    # Try to find the correct column automatically
+    try:
+        chosen_orig = autodetect_header_column(original_columns, target=TARGET_COLUMN)
+        # map chosen_orig to the normalized name used in df (since df.columns are normalized)
+        chosen_norm = normalize_colname(chosen_orig)
+        print(f"Using column: '{chosen_orig}' (normalized as '{chosen_norm}') for parsing")
+    except KeyError as e:
+        # Provide helpful debug info
+        print(str(e))
+        print("Normalized available columns:", list(df.columns))
+        raise
+
+    # now parse values from the chosen normalized column
+    parsed_rows = [parse_header_value(val) for val in df[chosen_norm]]
+    parsed_df = pd.DataFrame(parsed_rows, index=df.index)
+
+    # to preserve original dataframe's columns (unnormalized), restore them in result
+    df_result = df.copy()
+    # rename df_result columns back to original names for neatness
+    df_result.columns = original_columns
+
+    # append parsed columns
+    result = pd.concat([df_result, parsed_df], axis=1)
+
     result.to_excel(output_xlsx, index=False)
     print(f"✅ Parsed results saved to: {output_xlsx}")
     return result
