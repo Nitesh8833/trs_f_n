@@ -99,3 +99,14 @@ def list_dynamic_gcs_folder_structure() -> Dict[str, Optional[List[str]]]:
 if __name__ == "__main__":
     result = list_dynamic_gcs_folder_structure()
     print("\nResult:", result)
+
+
+*******************
+    parser = argparse.ArgumentParser(description="Worker script on Dataproc")
+    parser.add_argument("--app-env", help="Application environment", default=None)
+    args = parser.parse_args()
+
+    # Prefer the passed-in arg; if missing, fallback to an environment variable or default.
+    app_env = args.app_env or os.getenv("APP_ENV", "dev")
+
+    print("Resolved APP_ENV:", app_env)
