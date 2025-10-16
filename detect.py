@@ -1,63 +1,101 @@
 import os
 from google.cloud import storage
+from typing import Dict, List, Optional
 
-def list_dynamic_gcs_folder_structure():
-    # 1️⃣ Detect current script path
+def detect_gcs_prefix_from_path(local_path: str) -> Optional[str]:
+    """
+    Try multiple heuristics to produce a gcs-style prefix (like 'dags/.../python_scripts/')
+    from a local filesystem path.
+    Returns prefix (ending with '/') or None if not detected.
+    """
+    # normalize
+    p = os.path.normpath(local_path)
+
+    # 1) Composer mount common path
+    marker = os.path.normpath("/home/airflow/gcs")
+    if p.startswith(marker):
+        # remove mount and take dirname
+        rel = p[len(marker) + 1:]  # +1 to remove the separator
+        rel_dir = os.path.dirname(rel)
+        return rel_dir + ("/" if not rel_dir.endswith("/") else "")
+
+    # 2) look for 'dags/' anywhere in path (very common)
+    idx = p.find(os.sep + "dags" + os.sep)
+    if idx != -1:
+        rel = p[idx+1:]  # include 'dags/...'
+        rel_dir = os.path.dirname(rel)
+        return rel_dir + ("/" if not rel_dir.endswith("/") else "")
+
+    # 3) look for '/gcs/' marker anywhere
+    idx = p.find(os.sep + "gcs" + os.sep)
+    if idx != -1:
+        rel = p[idx+1:]
+        rel_dir = os.path.dirname(rel)
+        return rel_dir + ("/" if not rel_dir.endswith("/") else "")
+
+    # 4) As a last resort return the script directory (relative local path)
+    rel_dir = os.path.dirname(p)
+    return rel_dir + ("/" if not rel_dir.endswith("/") else "")
+
+
+def list_dynamic_gcs_folder_structure() -> Dict[str, Optional[List[str]]]:
+    """
+    Detect bucket/prefix when possible. If GCS_BUCKET not present, attempt to infer
+    prefix (the path after bucket) from the current script path using heuristics.
+    Returns a dict with keys: bucket, prefix, files, folders.
+    """
     local_path = os.path.abspath(__file__)
-    print(f"📄 Local path: {local_path}")
+    print(f"Local path: {local_path}")
 
-    # 2️⃣ Try to get Composer bucket dynamically
-    bucket_name = os.getenv("GCS_BUCKET")
+    bucket_name = os.getenv("GCS_BUCKET")  # Composer provides this
+    prefix = None
 
-    # 3️⃣ If not running in Composer, handle gracefully
-    if not bucket_name:
-        print("⚠️ Environment variable 'GCS_BUCKET' not found.")
-        print("ℹ️ Not running in Cloud Composer — please set bucket_name manually if needed.")
-        return {
-            "bucket": None,
-            "prefix": None,
-            "files": [],
-            "folders": []
-        }
+    if bucket_name:
+        # Composer environment: convert local path to prefix after /home/airflow/gcs/
+        prefix = detect_gcs_prefix_from_path(local_path)
+        print(f"Detected Composer bucket: {bucket_name}")
+        print(f"Detected prefix: {prefix}")
+    else:
+        # Not Composer: attempt to infer prefix from path (dags/... or script dir)
+        print("GCS_BUCKET env var not found — attempting to infer prefix from local path.")
+        prefix = detect_gcs_prefix_from_path(local_path)
+        print(f"Inferred prefix (path after bucket if this were in GCS): {prefix}")
+        # bucket_name remains None — user asked only for path after bucket so that's fine.
 
-    # 4️⃣ Convert local path to GCS prefix
-    # Example: /home/airflow/gcs/dags/...  →  dags/...
-    gcs_prefix = local_path.replace("/home/airflow/gcs/", "")
-    gcs_prefix = os.path.dirname(gcs_prefix)
-    if not gcs_prefix.endswith("/"):
-        gcs_prefix += "/"
-
-    print(f"🪣 Detected bucket: {bucket_name}")
-    print(f"📁 Detected prefix: {gcs_prefix}")
-
-    # 5️⃣ Initialize GCS client
-    client = storage.Client()
-
-    # 6️⃣ Use delimiter='/' to get folder-like hierarchy
-    iterator = client.list_blobs(bucket_name, prefix=gcs_prefix, delimiter='/')
-
+    # If we have a bucket name, list from GCS; otherwise just return the inferred prefix
     files = []
-    for blob in iterator:
-        files.append(blob.name)
+    folders = []
 
-    folders = list(iterator.prefixes)
+    if bucket_name:
+        client = storage.Client()
+        iterator = client.list_blobs(bucket_name, prefix=prefix or "", delimiter='/')
 
-    # 7️⃣ Print results
-    print("\n📂 Files directly under:", gcs_prefix)
-    for f in files:
-        print("   🗎", f)
+        # gather files
+        for blob in iterator:
+            files.append(blob.name)
 
-    print("\n📁 Subfolders under:", gcs_prefix)
-    for sf in folders:
-        print("   📂", sf)
+        # gather immediate subfolders
+        folders = list(iterator.prefixes)
+
+        print("\nFiles directly under:", prefix)
+        for f in files:
+            print("  ", f)
+
+        print("\nSubfolders under:", prefix)
+        for sf in folders:
+            print("  ", sf)
+    else:
+        # No bucket — we only provide the inferred prefix/path (no GCS listing)
+        print("\nNo bucket available. Skipping GCS list. Returning inferred prefix only.")
 
     return {
         "bucket": bucket_name,
-        "prefix": gcs_prefix,
+        "prefix": prefix,
         "files": files,
         "folders": folders
     }
 
-# Run directly
+
 if __name__ == "__main__":
-    list_dynamic_gcs_folder_structure()
+    result = list_dynamic_gcs_folder_structure()
+    print("\nResult:", result)
