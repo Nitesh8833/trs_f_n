@@ -74,3 +74,32 @@ if __name__ == "__main__":
     result = detect_env_from_gcs_uri()
     print(f"Environment: {result['env']}")
     print(f"GCS URI: {result['gcs_uri']}")
+
+***************************************************
+import os
+from google.cloud import storage
+
+# Example: Set environment variable for authentication
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/service_account.json"
+
+def get_gsutil_uri(bucket_name, file_name):
+    """
+    Returns the gsutil URI (gs://bucket_name/file_name)
+    for a specified file in a Google Cloud Storage bucket.
+    """
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(file_name)
+
+    # Construct gsutil URI
+    gs_uri = f"gs://{blob.bucket.name}/{blob.name}"
+    return gs_uri
+
+if __name__ == "__main__":
+    # Example bucket and file
+    bucket_name = "your-bucket-name"
+    file_name = "path/to/your_file.py"
+
+    print("Fetching GCS URI...")
+    uri = get_gsutil_uri(bucket_name, file_name)
+    print(f"The gsutil URI for the file is: {uri}")
