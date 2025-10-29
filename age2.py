@@ -9,10 +9,16 @@ def transform_age_ranges(
     out_col: str = "age",
 ) -> pd.DataFrame:
     """
-    Pure function: parses human-readable age ranges in a source column and writes
-    TWO output columns:
-        - f"min_{out_col}"  (e.g., 'min_age')
-        - f"max_{out_col}"  (e.g., 'max_age')
+    Parses human-readable age ranges and writes TWO columns:
+      - f"min_{out_col}", f"max_{out_col}"
+
+    Header semantics added:
+      - If header contains "min", "minimum", or "from" (e.g., "Accepts Minimum Patient Age",
+        "Minimum Age", "Min Age", "Age Range From") and the cell has a single number,
+        force min=<that number>, max=150 for that row.
+    Also:
+      - "0 - 99+ years" (or similar with +/* on the upper bound) -> min=0, max=150.
+      - Robust "and up/over/older/above" (incl. messy/collapsed forms) -> min=number, max=150.
     """
     # ---------------------------- helpers ----------------------------
     def norm_col(s: str) -> str:
@@ -38,7 +44,7 @@ def transform_age_ranges(
         )
         return float(m.group(1)) / 12.0 if m else None
 
-    # Phrase lexicon (kept from your version)
+    # Phrase lexicon
     PHRASE_RULES = [
         (re.compile(r'\b(newborn|neonate|neonatal)\b', re.I),
          lambda t: (0.0, 0.08, "lex_newborn")),
@@ -54,9 +60,7 @@ def transform_age_ranges(
          lambda t: (0.0, 17.0, "lex_newborn_to_17")),
     ]
 
-    # ---- NEW: robust "and up / over / older / above" detector (with typos/collapses) ----
-    # Handles: 18 and up, 18 & up, 18 or up, 18 and over/older/above,
-    #          18and up, 18andUp, 18 a nd Up, 18 years and older, etc.
+    # Robust "and up / over / older / above" detector (typos/collapses tolerated)
     def is_min_only_up_over(text: str):
         if text is None:
             return None
@@ -64,26 +68,25 @@ def transform_age_ranges(
         t = str(text)
         tl = t.lower()
 
-        # a) Special-cased: allow up to 3 words (e.g., "years") between the number and the keyword
+        # Allow up to 3 words between number and keyword (e.g., "18 years and older")
         m = re.search(
             r'(\d+(?:\.\d+)?)\s*(?:[a-z/]+\s*){0,3}?(?:'
             r'\+|\*|'
             r'(?:and|&|or)\s*(?:up|over|older|above)|'
             r'up|over|older|above'
             r')\b',
-            tl,
-            re.I,
+            tl, re.I
         )
         if m:
             return float(m.group(1))
 
-        # b) Collapsed/typo forms (strip non-alnum except +, *)
+        # Collapsed/typo forms (e.g., "18andUp", "18a ndUp")
         collapsed = re.sub(r'[^a-z0-9+*]', '', tl)
         m2 = re.search(r'^(\d+(?:\.\d+)?)((years?|yrs?|yr|yo|y/o)?)and(?:up|over|older|above)\b', collapsed, re.I)
         if m2:
             return float(m2.group(1))
 
-        # c) "a n d up" spaced letters (already handled largely by (a), but keep a tolerant fallback)
+        # Spelled-out spaced letters: "a n d up"
         m3 = re.search(r'(\d+(?:\.\d+)?)\s*a\s*n\s*d\s+u\s*p\b', tl, re.I)
         if m3:
             return float(m3.group(1))
@@ -96,19 +99,16 @@ def transform_age_ranges(
 
         t_raw = str(value).strip()
         tl = t_raw.lower()
+        tl_norm = tl.replace('—', '-').replace('–', '-').replace(' to ', '-')
 
         # Lexicon first
         for pat, fn in PHRASE_RULES:
             if pat.search(t_raw):
                 return fn(t_raw)
 
-        # Normalize some punctuation/phrasing for easier matching
-        tl_norm = tl.replace('—', '-').replace('–', '-').replace(' to ', '-')
-
-        # ---- NEW: Special case "range upper has +/*" like "0 - 99+ years" => min=left, max=150
+        # SPECIAL: range upper has +/*  => left as min, max=150   e.g., "0 - 99+ years"
         m_rng_plus = re.search(
-            r'(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)\s*[\+\*]\b',
-            tl_norm
+            r'(\d+(?:\.\d+)?)\s*[-~]\s*(\d+(?:\.\d+)?)\s*[\+\*]\b', tl_norm
         )
         if m_rng_plus:
             lo = float(m_rng_plus.group(1))
@@ -117,7 +117,7 @@ def transform_age_ranges(
                 lo, hi = hi, lo
             return (lo, 150.0, "range_upper_plus_as_150")
 
-        # "+/*" min-only: "18+", "18 *" (strict lone or inline) — keep but AFTER the range+ case above
+        # "+/*" min-only (either strict or inline)
         m_plus_strict = re.search(r'^\s*(\d+(?:\.\d+)?)\s*[\+\*]+\s*$', t_raw)
         if m_plus_strict:
             return (float(m_plus_strict.group(1)), 150.0, "min_plus_or_star")
@@ -126,7 +126,7 @@ def transform_age_ranges(
         if m_plus_inline:
             return (float(m_plus_inline.group(1)), 150.0, "min_plus_or_star_inline")
 
-        # ---- NEW: Unified "and up/over/older/above" (incl. messy forms) => min=number, max=150
+        # Unified "and up/over/older/above" => min=number, max=150
         up_over_num = is_min_only_up_over(t_raw)
         if up_over_num is not None:
             return (up_over_num, 150.0, "min_only_up_over")
@@ -134,7 +134,7 @@ def transform_age_ranges(
         # Months explicit (with extended synonyms)
         months_years = parse_months_to_years(t_raw)
         if months_years is not None:
-            # Treat "and up/over/older/above" and +/* as min-only
+            # Treat up/over/older/above and +/* as min-only
             if re.search(r'(?:\+|\*|(?:and|&|or)\s*(?:up|over|older|above)|up|over|older|above)\b', tl):
                 return (months_years, 150.0, "months_plus_or_up")
             # Max-only variants
@@ -151,34 +151,34 @@ def transform_age_ranges(
                 lo, hi = hi, lo
             return (lo, hi, "range")
 
-        # Max-only (under/below/less than/up to ... or "X and younger")
+        # Max-only (under/below/less than/up to ... OR "X and younger")
         if re.search(r'(under|below|less than|up to)\s*(\d+(?:\.\d+)?)', tl_norm) or \
            re.search(r'(\d+(?:\.\d+)?)\s*(and younger|younger)', tl_norm):
             nums = [float(x) for x in re.findall(r'\d+(?:\.\d+)?', tl_norm)]
             maxv = nums[-1] if nums else None
             return (0.0, maxv, "max_only")
 
-        # Single number -> ambiguous (we'll resolve via header rules later)
+        # Single number -> ambiguous (resolve via header rules later)
         if len(re.findall(r'\d+(?:\.\d+)?', tl_norm)) == 1:
             return (None, None, "single_ambiguous")
 
         return (None, None, "unparsed")
 
-    # ---- Header helpers (enhanced "From") ----
+    # ---- Header helpers (explicit MIN/FROM semantics) ----
     def is_min_header(h: str):
         hl = str(h).lower()
-        return (
-            any(k in hl for k in [' min', 'minimum', 'min ', '(min', '>=', 'lower bound']) or
+        # Covers: "Accepts Minimum Patient Age", "Minimum Age", "Min Age", "Age Range From", etc.
+        return bool(
+            re.search(r'\b(min|minimum|from)\b', hl) or
             hl.endswith(' min') or hl.startswith('min') or
-            re.search(r'\bfrom\b', hl) is not None  # NEW: treat "From" as min header
+            any(k in hl for k in [' min', 'min ', '(min', '>=', 'lower bound'])
         )
 
     def is_max_header(h: str):
         hl = str(h).lower()
-        return (
-            any(k in hl for k in [' max', 'maximum', 'max ', '(max', '<=', 'upper bound']) or
-            hl.endswith(' max') or hl.startswith('max')
-            # (Optional) If you ever want "To" as max header, add: or re.search(r'\bto\b', hl)
+        return bool(
+            hl.endswith(' max') or hl.startswith('max') or
+            any(k in hl for k in [' max', 'maximum', 'max ', '(max', '<=', 'upper bound'])
         )
 
     # ---------------------------- main ----------------------------
@@ -208,15 +208,27 @@ def transform_age_ranges(
         pmin, pmax, note = parse_age_phrase(v)
         v_text = "" if (v is None or (isinstance(v, float) and math.isnan(v))) else str(v)
 
-        # If header is a "From" style min header, prefer treating a single bare number as MIN
-        # (the next block won't trigger because we check "not is_min_header(h)")
+        # If NOT a "min header" and it's a single bare number, assume it's a MAX (0..N)
         if note == "single_ambiguous" and count_numbers(v_text) == 1 and not is_min_header(h):
             only_num = extract_first_number(v_text)
             pmin, pmax, note = (0.0, only_num, "assumed_single_as_max")
 
-        # Header hints (these run regardless of above)
-        if is_min_header(h) and (pmin is None):
-            pmin = extract_first_number(v_text)
+        # ---- HEADER OVERRIDES ----
+        # If it's a MIN header ("min", "minimum", "from"), force MIN semantics for a single number
+        if is_min_header(h):
+            num = extract_first_number(v_text)
+            if num is not None:
+                # If parser gave max_only/single_ambiguous/unparsed, override to min=num, max=150
+                if note in ("single_ambiguous", "max_only", "unparsed"):
+                    pmin, pmax, note = (num, 150.0, "header_forced_min")
+                # If min wasn't set by parser, set it
+                if pmin is None:
+                    pmin = num
+                # If only a single numeric token present and max missing, set max=150
+                if (pmax is None) and (count_numbers(v_text) == 1):
+                    pmax = 150.0
+
+        # Max-header hint (if desired; does not override strong parses)
         if is_max_header(h) and (pmax is None):
             pmax = extract_first_number(v_text)
 
