@@ -1,18 +1,20 @@
-# Update: Output exactly these FOUR columns in a single sheet:
-# 1) "Accepts Minimum Patient Age"  (raw value from the first detected Min/From column; empty if none)
-# 2) "Accepts Maximum Patient Age"  (raw value from the first detected Max/To column; empty if none)
-# 3) "min_age"  (parsed per rules, only from non-numeric inputs)
-# 4) "max_age"  (parsed per rules, only from non-numeric inputs)
-#
-# Rules preserved: 100+ -> 100/150; 'newborn and 10' -> 0/10; 'fetal'->0; days->years; month ranges; etc.
-# Fallback: if both min & max blank after parsing but a generic Age column has non-numeric text, parse it to both.
-# Source file preference remains Book2222.xlsx if present.
+# Reads Book2222.xlsx if present, else Book2221.xlsx.
+# Writes ONE sheet with exactly these columns:
+#   "Accepts Minimum Patient Age", "Accepts Maximum Patient Age", "min_age", "max_age"
+# Rules:
+# - 100+ -> (100, 150)
+# - fetal -> 0 (both if only generic Age; if on a side, that side = 0)
+# - "newborn and 10" (same cell) -> (0, 10)
+# - Cross-column: one side "newborn" + other side has/is a number -> (0, number)
+# - Min is numeric (e.g., 12) and Max text has numbers like "65 99" -> (12, 99) [largest]
+# - "28 days" -> years; day ranges -> year ranges
+# - Generic ranges, <=, <, under/below, >=, >, months->years, etc.
+# - Only non-numeric inputs are transformed; pure numbers stay blank unless cross-column override applies.
 
 import os, re, math
 from typing import List, Tuple, Optional, Any, Dict
 import numpy as np
 import pandas as pd
-from caas_jupyter_tools import display_dataframe_to_user
 
 MAX_AGE = 150.0
 PREFER_PATHS = ["/mnt/data/Book2222.xlsx", "/mnt/data/Book2221.xlsx"]
@@ -20,6 +22,7 @@ SOURCE_PATH = next((p for p in PREFER_PATHS if os.path.exists(p)), PREFER_PATHS[
 OUT_PATH = "/mnt/data/Book2221_minmax_textual_only.xlsx"
 
 def _tokens(h: str) -> List[str]:
+    import re
     return [t for t in re.split(r'[^A-Za-z0-9]+', str(h).strip().lower()) if t]
 
 def is_min_header(h: str) -> bool:
@@ -50,6 +53,7 @@ def categorize_headers(df: pd.DataFrame) -> Dict[str, List[str]]:
     return {"min_cols": min_cols, "max_cols": max_cols, "age_cols": age_cols}
 
 def _is_pure_numeric(v: Any) -> bool:
+    import re, math, numpy as np
     if isinstance(v, (int, float, np.integer, np.floating)):
         try:
             return math.isfinite(float(v))
@@ -63,6 +67,7 @@ def _days_to_years(d: float) -> float:
     return round(float(d) / 365.0, 4)
 
 def parse_age_expression(value: Any) -> Tuple[Optional[float], Optional[float], str]:
+    import re, numpy as np
     if value is None or (isinstance(value, float) and np.isnan(value)) or (isinstance(value, str) and value.strip()==""):
         return None, None, "empty"
     s = str(value).strip().lower()
@@ -183,7 +188,99 @@ def first_non_null(row: pd.Series, cols: List[str]) -> Tuple[Optional[Any], Opti
             return row[c], c
     return None, None
 
+# def transform_exact_columns(df: pd.DataFrame) -> pd.DataFrame:
+#     if isinstance(df.columns, pd.MultiIndex):
+#         df = df.copy()
+#         df.columns = ['_'.join([str(x) for x in tup if x is not None]) for tup in df.columns]
+
+#     cats = categorize_headers(df)
+#     min_cols, max_cols, age_cols = cats["min_cols"], cats["max_cols"], cats["age_cols"]
+
+#     min_col_name = min_cols[0] if min_cols else None
+#     max_col_name = max_cols[0] if max_cols else None
+
+#     out_rows = []
+#     for _, row in df.iterrows():
+#         vmin = row[min_col_name] if min_col_name else None
+#         vmax = row[max_col_name] if max_col_name else None
+
+#         mn_out = np.nan
+#         mx_out = np.nan
+#         handled = False
+#         rule_min = None
+#         rule_max = None
+
+#         # ---------- CROSS-COLUMN OVERRIDES ----------
+#         def _is_text_newborn(x: Any) -> bool:
+#             return isinstance(x, str) and re.search(r'\bnewborns?\b', x, re.I) is not None
+#         def _nums_in_text(x: Any) -> list[float]:
+#             if x is None or (isinstance(x, float) and np.isnan(x)):
+#                 return []
+#             return [float(n) for n in re.findall(r'\d{1,3}(?:\.\d+)?', str(x))]
+
+#         newborn_left  = _is_text_newborn(vmin)
+#         newborn_right = _is_text_newborn(vmax)
+#         nums_left  = _nums_in_text(vmin)
+#         nums_right = _nums_in_text(vmax)
+
+#         # Case A: one side "newborn", other contains/is a number -> (0, max number)
+#         if (newborn_left and (_is_pure_numeric(vmax) or nums_right)) or \
+#            (newborn_right and (_is_pure_numeric(vmin) or nums_left)):
+#             candidates = []
+#             if _is_pure_numeric(vmax): candidates.append(float(vmax))
+#             if _is_pure_numeric(vmin): candidates.append(float(vmin))
+#             candidates += nums_left + nums_right
+#             candidates = [n for n in candidates if n > 0]
+#             if candidates:
+#                 mn_out = 0.0
+#                 mx_out = max(candidates)
+#                 rule_min = "cross_newborn_number"; rule_max = "cross_newborn_number"
+#                 handled = True
+
+#         # Case B: Min is pure numeric, Max text contains multiple numbers -> use largest as max
+#         if not handled and _is_pure_numeric(vmin) and (vmax is not None) and not _is_pure_numeric(vmax):
+#             nums = _nums_in_text(vmax)
+#             if nums:
+#                 mn_out = float(vmin)
+#                 mx_out = max(nums)
+#                 rule_min = "numeric_min"; rule_max = "max_from_text_numbers"
+#                 handled = True
+
+#         # ---------- PER-CELL PARSE (non-numeric only) ----------
+#         if not handled and vmin is not None and not _is_pure_numeric(vmin):
+#             mn, mx, rule = parse_age_expression(vmin)
+#             if mn is not None: mn_out = mn; rule_min = rule
+#             if mx is not None: mx_out = mx; rule_max = rule
+
+#         if not handled and vmax is not None and not _is_pure_numeric(vmax):
+#             mn, mx, rule = parse_age_expression(vmax)
+#             if mn is not None and pd.isna(mn_out): mn_out = mn; rule_min = rule_min or rule
+#             if mx is not None: mx_out = mx; rule_max = rule
+
+#         # ---------- GENERIC AGE FALLBACK ----------
+#         if pd.isna(mn_out) and pd.isna(mx_out):
+#             vage, cage = first_non_null(row, age_cols)
+#             if vage is not None and not _is_pure_numeric(vage):
+#                 mn, mx, rule = parse_age_expression(vage)
+#                 if mn is not None: mn_out = mn
+#                 if mx is not None: mx_out = mx
+
+#         out_rows.append({
+#             "Accepts Minimum Patient Age": vmin,
+#             "Accepts Maximum Patient Age": vmax,
+#             "min_age": mn_out,
+#             "max_age": mx_out
+#         })
+
+#     out = pd.DataFrame(out_rows, columns=[
+#         "Accepts Minimum Patient Age",
+#         "Accepts Maximum Patient Age",
+#         "min_age",
+#         "max_age"
+#     ])
+#     return out
 def transform_exact_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Flatten multi-index headers if any
     if isinstance(df.columns, pd.MultiIndex):
         df = df.copy()
         df.columns = ['_'.join([str(x) for x in tup if x is not None]) for tup in df.columns]
@@ -191,32 +288,74 @@ def transform_exact_columns(df: pd.DataFrame) -> pd.DataFrame:
     cats = categorize_headers(df)
     min_cols, max_cols, age_cols = cats["min_cols"], cats["max_cols"], cats["age_cols"]
 
-    # Choose the *first* detected min and max columns to copy raw into the two required output columns
+    # Use the *actual* detected source header names as output headers
     min_col_name = min_cols[0] if min_cols else None
     max_col_name = max_cols[0] if max_cols else None
+
+    # Fallback labels (only used if detection failed)
+    out_min_header = min_col_name or "Accepts Minimum Patient Age"
+    out_max_header = max_col_name or "Accepts Maximum Patient Age"
+
+    def _is_text_newborn(x: Any) -> bool:
+        return isinstance(x, str) and re.search(r'\bnewborns?\b', x, re.I) is not None
+
+    def _nums_in_text(x: Any) -> list[float]:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return []
+        return [float(n) for n in re.findall(r'\d{1,3}(?:\.\d+)?', str(x))]
 
     out_rows = []
     for _, row in df.iterrows():
         vmin = row[min_col_name] if min_col_name else None
         vmax = row[max_col_name] if max_col_name else None
 
-        # Initialize outputs
         mn_out = np.nan
         mx_out = np.nan
+        handled = False
+        rule_min = None
+        rule_max = None
 
-        # Parse non-numeric only
-        if vmin is not None and not _is_pure_numeric(vmin):
+        # -------- CROSS-COLUMN OVERRIDES --------
+        newborn_left  = _is_text_newborn(vmin)
+        newborn_right = _is_text_newborn(vmax)
+        nums_left  = _nums_in_text(vmin)
+        nums_right = _nums_in_text(vmax)
+
+        # Case A: one side "newborn", other side contains/is a number -> (0, max number)
+        if (newborn_left and (_is_pure_numeric(vmax) or nums_right)) or \
+           (newborn_right and (_is_pure_numeric(vmin) or nums_left)):
+            candidates = []
+            if _is_pure_numeric(vmax): candidates.append(float(vmax))
+            if _is_pure_numeric(vmin): candidates.append(float(vmin))
+            candidates += nums_left + nums_right
+            candidates = [n for n in candidates if n > 0]
+            if candidates:
+                mn_out = 0.0
+                mx_out = max(candidates)
+                rule_min = "cross_newborn_number"; rule_max = "cross_newborn_number"
+                handled = True
+
+        # Case B: min is pure numeric, max text has numbers like "65 99" -> (min, largest_in_max_text)
+        if not handled and _is_pure_numeric(vmin) and (vmax is not None) and not _is_pure_numeric(vmax):
+            nums = _nums_in_text(vmax)
+            if nums:
+                mn_out = float(vmin)
+                mx_out = max(nums)
+                rule_min = "numeric_min"; rule_max = "max_from_text_numbers"
+                handled = True
+
+        # -------- PER-CELL PARSE (non-numeric only) --------
+        if not handled and vmin is not None and not _is_pure_numeric(vmin):
             mn, mx, rule = parse_age_expression(vmin)
-            if mn is not None: mn_out = mn
-            if mx is not None: mx_out = mx
+            if mn is not None: mn_out = mn; rule_min = rule
+            if mx is not None: mx_out = mx; rule_max = rule
 
-        if vmax is not None and not _is_pure_numeric(vmax):
+        if not handled and vmax is not None and not _is_pure_numeric(vmax):
             mn, mx, rule = parse_age_expression(vmax)
-            # Fill whichever sides are provided; do not overwrite already set values unless needed
-            if mn is not None and (pd.isna(mn_out)): mn_out = mn
-            if mx is not None: mx_out = mx  # max from max-side takes precedence
+            if mn is not None and pd.isna(mn_out): mn_out = mn; rule_min = rule_min or rule
+            if mx is not None: mx_out = mx; rule_max = rule
 
-        # Fallback to generic age text ONLY if both still NaN
+        # -------- GENERIC AGE FALLBACK --------
         if pd.isna(mn_out) and pd.isna(mx_out):
             vage, cage = first_non_null(row, age_cols)
             if vage is not None and not _is_pure_numeric(vage):
@@ -225,21 +364,17 @@ def transform_exact_columns(df: pd.DataFrame) -> pd.DataFrame:
                 if mx is not None: mx_out = mx
 
         out_rows.append({
-            "Accepts Minimum Patient Age": vmin,
-            "Accepts Maximum Patient Age": vmax,
+            out_min_header: vmin,   # dynamic header (actual source min column name)
+            out_max_header: vmax,   # dynamic header (actual source max column name)
             "min_age": mn_out,
             "max_age": mx_out
         })
 
-    out = pd.DataFrame(out_rows, columns=[
-        "Accepts Minimum Patient Age",
-        "Accepts Maximum Patient Age",
-        "min_age",
-        "max_age"
-    ])
+    # Build DataFrame with dynamic headers in the correct order
+    out = pd.DataFrame(out_rows, columns=[out_min_header, out_max_header, "min_age", "max_age"])
     return out
 
-# Execute and write
+
 if os.path.exists(SOURCE_PATH):
     try:
         df_src = pd.read_excel(SOURCE_PATH)
@@ -248,9 +383,3 @@ if os.path.exists(SOURCE_PATH):
     out_df = transform_exact_columns(df_src)
     with pd.ExcelWriter(OUT_PATH, engine="xlsxwriter") as xw:
         out_df.to_excel(xw, index=False, sheet_name="result")
-    try:
-        display_dataframe_to_user("Preview — Exact 4 columns (result)", out_df.head(50))
-    except Exception as e:
-        print("Preview display failed:", e)
-
-OUT_PATH
